@@ -1,0 +1,42 @@
+name: Offline workshop gates
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  offline:
+    # Preprovision pinned Node/pnpm/Terraform, an unpacked provider mirror,
+    # the complete frozen pnpm store and Chromium. No download fallback.
+    # Runner paths below are approved repository variables, not credentials.
+    # No Cloudflare credentials. Live qualification is separate.
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      OFFLINE_TF_PROVIDER_MIRROR: ${{ vars.OFFLINE_TF_PROVIDER_MIRROR }}
+      OFFLINE_TERRAFORM_BIN: ${{ vars.OFFLINE_TERRAFORM_BIN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Owned scratch and resource check
+        shell: bash
+        run: |
+          SCRATCH=$(mktemp -d /tmp/cfw.XXXXXX)
+          echo "KIROCREW_SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          free -m
+          df -m .
+          ps -eo pid,comm,pcpu,rss --sort=-rss | head -12
+      - name: Complete offline gates with clean per-batch environments
+        shell: bash
+        run: |
+          env -i PATH="$PATH" KIROCREW_SCRATCH="$KIROCREW_SCRATCH" OFFLINE_TF_PROVIDER_MIRROR="$OFFLINE_TF_PROVIDER_MIRROR" OFFLINE_TERRAFORM_BIN="$OFFLINE_TERRAFORM_BIN" PNPM_STORE_DIR="${PNPM_STORE_DIR:-$HOME/.local/share/pnpm/store}" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" node scripts/offline-gates.mjs
+      # The runner executes pnpm install --offline --frozen-lockfile;
+      # types, unit/integration, --maxWorkers=1, builds, loopback browsers,
+      # acceptance, golden path, and the Terraform bootstrap contract:
+      # infra/terraform, infra/terraform/core-public, infra/terraform/routing.
+      # Each static root is copied without state into owned scratch, then
+      # init -backend=false -input=false -get=false -upgrade=false -lockfile=readonly
+      # uses a lock-hash-checked filesystem_mirror only (no direct fallback),
+      # followed by validate. Also fmt, actual Wrangler version and contracts.
+      # Scratch work/HOME/provider copies are removed; bounded gate logs remain.
+      # Missing tools/cache/locks fail exact gates and the job, never become a pass.

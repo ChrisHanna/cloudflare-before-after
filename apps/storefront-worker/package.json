@@ -1,0 +1,1 @@
+{"name":"@lab/storefront-worker","private":true,"version":"0.1.0","type":"module","dependencies":{"hono":"4.13.16","@lab/contracts":"workspace:*","@cloudflare/containers":"0.3.7"}}

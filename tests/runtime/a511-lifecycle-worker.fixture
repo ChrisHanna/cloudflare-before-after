@@ -1,0 +1,86 @@
+import { DurableObject } from 'cloudflare:workers';
+import { OriginContainer, ContainerProxy } from '../../apps/storefront-worker/src/deployed.js';
+import { deriveIngestSecret } from '../../apps/storefront-worker/src/registry.js';
+export { ContainerProxy };
+const canary = 'LIFECYCLE_PROVIDER_CANARY_PRIVATE';
+export class LifecycleHarness extends DurableObject {
+  running = false; stops = 0; operations = new Map();
+  constructor(ctx, env) {
+    super(ctx, env); const harness = this;
+    Object.defineProperty(ctx, 'container', { configurable: true, value: {
+      get running() { return harness.running; },
+      start() { harness.running = true; }, monitor() { return new Promise(() => {}); },
+      signal() { harness.stops++; harness.running = false; }, async destroy() { harness.running = false; },
+      async interceptAllOutboundHttp() {}, async interceptOutboundHttp() {}, async interceptOutboundHttps() {},
+      getTcpPort() { return { async fetch(input, init) {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (request.method === 'GET') return new Response('ready');
+        const payload = await request.json(); const op = harness.operations.get(payload.requestId);
+        op.started = true;
+        // A 200 only completes if both stages are acked by the DO; stand in for the Node app.
+        if (op.mode !== 'forward-error') await harness.stages(request, payload);
+        if (op.mode === 'forward-error') { op.finished = true; throw new Error(canary); }
+        if (op.mode === 'headers') {
+          await new Promise((resolve, reject) => {
+            op.release = resolve;
+            request.signal.addEventListener('abort', () => { op.finished = true; reject(new DOMException(canary, 'AbortError')); }, { once: true });
+          });
+        }
+        if (op.mode === 'empty') { op.finished = true; return new Response(null, { status: 204 }); }
+        return new Response(new ReadableStream({
+          start(controller) { op.controller = controller; },
+          cancel() { op.cancelled++; op.finished = true; if (op.mode === 'cancel-error') throw new Error(canary); },
+        }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/json' } });
+      } }; },
+    } });
+    this.inner = new OriginContainer(ctx, env);
+  }
+  async alarm() { return this.inner.alarm(); }
+  async stages(request, payload) {
+    const hex = async (text, secret) => { const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return [...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text)))].map(v => v.toString(16).padStart(2, '0')).join(''); };
+    const sha = async text => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))].map(v => v.toString(16).padStart(2, '0')).join('');
+    const encoded = request.headers.get('x-origin-receipt-reservation'); const signature = request.headers.get('x-origin-receipt-signature'); const reservation = JSON.parse(encoded);
+    const root = this.env.INGEST_ROOT_SECRET; const identity = { producerId: reservation.producerId, role: reservation.role, scenarioId: reservation.scenarioId, runId: reservation.runId, releaseDigest: reservation.releaseDigest };
+    const authorization = `Bearer ${await deriveIngestSecret(identity, root)}`;
+    for (const stage of ['entry', 'completion']) {
+      const receipt = { schemaVersion: 1, id: reservation[stage].id, runId: reservation.runId, requestId: payload.requestId, scenarioId: reservation.scenarioId, targetRole: reservation.role, producerId: reservation.producerId, sequence: reservation[stage].sequence, observedAt: reservation.observedAt, rayId: payload.rayId ?? null, releaseDigest: reservation.releaseDigest, stage };
+      const prepared = await this.inner.receiptStage({ mode: 'prepare', receipt, encoded, signature, authorization });
+      const stamp = JSON.stringify({ schemaVersion: 1, receiptId: receipt.id, acceptedAt: prepared.acceptedAt, receiptDigest: await sha(JSON.stringify(receipt)) });
+      await this.inner.receiptStage({ mode: 'ack', receipt, encoded, signature, authorization, ackProof: await hex(`origin-stage-acceptance-v1\n${stamp}`, root) });
+    }
+  }
+  async fetch(request) {
+    const u = new URL(request.url); const id = u.searchParams.get('id');
+    if (u.pathname === '/begin') {
+      const spec = await request.json(); const abort = new AbortController();
+      const op = { mode: spec.mode, started: false, finished: false, settled: false, cancelled: 0, status: null, abort }; this.operations.set(id, op);
+      const task = this.inner.fetch(new Request('http://container.internal/internal/render', { method: 'POST', signal: abort.signal, headers: { authorization: `Bearer ${this.env.INTERNAL_SECRET}`, 'content-type': 'application/json' }, body: JSON.stringify({ targetRole: 'before', scenarioId: 'analytics', runId: this.env.RUN_ID, requestId: id }) })).then(response => { op.response = response; op.status = response.status; op.settled = true; }).catch(() => { op.status = 599; op.settled = true; });
+      this.ctx.waitUntil(task); return new Response(null, { status: 202 });
+    }
+    const op = this.operations.get(id);
+    if (u.pathname === '/on-error') { try { this.inner.onError(new Error(canary)); } catch (error) { return Response.json({ safe: !String(error).includes(canary) }); } return Response.json({ safe: true }); }
+    if (u.pathname === '/facts') return Response.json({ running: this.running, stops: this.stops, started: op?.started ?? false, settled: op?.settled ?? false, finished: op?.finished ?? false, cancelled: op?.cancelled ?? 0, status: op?.status ?? null, sdkInflight: this.inner.inflightRequests, sdkExpired: this.inner.isActivityExpired() });
+    if (u.pathname === '/alarm') {
+      // Test-only deadline injection; the actual SDK alarm and hook are unmodified.
+      this.inner.sleepAfterMs = Date.now() - 1; await this.inner.alarm();
+      return Response.json({ running: this.running, stops: this.stops });
+    }
+    if (u.pathname === '/release') { op.release?.(); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/abort') { op.abort.abort(new Error(canary)); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/cancel') { await op.response.body?.cancel(new Error(canary)); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/consume') {
+      op.reading = true;
+      this.ctx.waitUntil(op.response.text().then(text => { op.readDone = true; op.leaked = text.includes(canary); }).catch(error => { op.readDone = true; op.leaked = String(error).includes(canary); }));
+      return new Response(null, { status: 202 });
+    }
+    if (u.pathname === '/chunk') { op.controller.enqueue(new TextEncoder().encode('synthetic')); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/close') { op.finished = true; op.controller.close(); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/body-error') { op.finished = true; op.controller.error(new Error(canary)); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/result') {
+      let text = ''; if (!op.reading && op.response) { try { text = await op.response.text(); } catch { text = 'fixed-error'; } }
+      return Response.json({ status: op.status, readDone: op.readDone ?? false, leaked: op.leaked === true || text.includes(canary), safe: !text.includes(canary) });
+    }
+    return new Response(null, { status: 404 });
+  }
+}
+export default { fetch(request, env) { const u = new URL(request.url); return env.ORIGINS.getByName(u.searchParams.get('key')).fetch(request); } };

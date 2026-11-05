@@ -1,0 +1,49 @@
+import { DurableObject } from 'cloudflare:workers';
+import { OriginContainer, ContainerProxy } from '../../apps/storefront-worker/src/deployed.js';
+import telemetry from '../../apps/storefront-worker/src/telemetry-deployed.js';
+export { ContainerProxy };
+export class RestartHarness extends DurableObject {
+  running = false; https;
+  constructor(ctx, env) {
+    super(ctx, env); const harness = this;
+    Object.defineProperty(ctx, 'container', { configurable: true, value: {
+      get running() { return harness.running; },
+      start(config) { harness.running = true; harness.config = config.env; },
+      monitor() { return new Promise(() => {}); }, signal() { harness.running = false; }, async destroy() { harness.running = false; },
+      async interceptAllOutboundHttp() {}, async interceptOutboundHttp() {},
+      async interceptOutboundHttps(host, fetcher) { harness.https = fetcher; },
+      getTcpPort() { return { async fetch(input, init) {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (new URL(request.url).pathname === '/') return new Response('ready');
+        const headers = new Headers(request.headers); headers.set('x-fixture-config', JSON.stringify(harness.config));
+        return fetch(`https://node-fixture.example.test${new URL(request.url).pathname}`, { method: request.method, headers, body: request.body, redirect: 'manual', signal: request.signal });
+      } }; },
+    } });
+    this.inner = new OriginContainer(ctx, env);
+  }
+  async alarm() { return this.inner.alarm(); }
+  async receiptStage(value) { return this.inner.receiptStage(value); }
+  async fetch(request) {
+    const u = new URL(request.url);
+    if (u.pathname === '/fixture/retention') {
+      const spec = request.method === 'POST' ? await request.json() : {};
+      const records = await this.ctx.storage.list({ prefix: 'receipt-request:', limit: 101 });
+      if (spec.ageMs !== undefined) for (const [key, record] of records) if (!spec.requestId || record.reservation.requestId === spec.requestId) await this.ctx.storage.put(key, { ...record, settledAt: new Date(Date.now() - spec.ageMs).toISOString() });
+      if (spec.forgetSettlement) { const key = 'receipt-request:' + spec.forgetSettlement; const record = await this.ctx.storage.get(key); const { settledAt, ...rest } = record; await this.ctx.storage.put(key, rest); }
+      const current = await this.ctx.storage.list({ prefix: 'receipt-request:', limit: 101 });
+      return Response.json({ allocator: await this.ctx.storage.get('receipt-sequences'), records: [...current.values()].map(record => ({ requestId: record.reservation.requestId, complete: record.complete, settledAt: record.settledAt })), count: current.size });
+    }
+    if (u.pathname === '/fixture/egress') return this.https.fetch(new Request('https://telemetry.example.test/ingest', request));
+    if (u.pathname === '/fixture/forget-allocator') { await this.ctx.storage.delete('receipt-sequences'); return new Response(null, { status: 204 }); }
+    if (u.pathname === '/fixture/identity') return Response.json({ identity: await this.ctx.storage.get('producer'), allocator: await this.ctx.storage.get('receipt-sequences') });
+    if (u.pathname === '/fixture/evict') this.ctx.abort('Synthetic eviction');
+    return this.inner.fetch(request);
+  }
+}
+export default {
+  fetch(request, env) {
+    const u = new URL(request.url);
+    if (u.hostname === 'telemetry.example.test') return telemetry.fetch(request, { ORIGIN: 'https://telemetry.example.test', DB_BEFORE: env.DB, DB_AFTER: env.DB, RELEASE_DIGEST: env.RELEASE_DIGEST, REGISTRY_SECRET_BEFORE: env.REGISTRY_SECRET, REGISTRY_SECRET_AFTER: env.REGISTRY_SECRET, INGEST_ROOT_SECRET_BEFORE: env.INGEST_ROOT_SECRET, INGEST_ROOT_SECRET_AFTER: env.INGEST_ROOT_SECRET, COLLECTOR_SECRET: env.COLLECTOR_SECRET });
+    return env.ORIGINS.getByName(u.searchParams.get('key')).fetch(new Request(`http://container.internal${u.pathname}${u.search}`, request));
+  },
+};

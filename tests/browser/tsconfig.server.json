@@ -1,0 +1,6 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": { "rootDir": "../..", "declaration": false, "sourceMap": false },
+  "include": ["../../apps/control-server/src/server.ts", "../fixtures/demo-lab.ts"],
+  "exclude": ["../../apps/storefront-worker/src/deployed.ts", "../../apps/storefront-worker/src/telemetry-deployed.ts"]
+}

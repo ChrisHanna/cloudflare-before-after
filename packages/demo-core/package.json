@@ -1,0 +1,1 @@
+{"name":"@lab/demo-core","private":true,"version":"0.1.0","type":"module","exports":"./src/index.ts","dependencies":{"@lab/contracts":"workspace:*","zod":"4.6.7"}}

@@ -1,0 +1,16 @@
+// Test-only Node-stage adapter for legacy native SDK/lifecycle fixtures.
+// Real production Node/HTTP/SQL coverage is in the restart P2 harness.
+export async function syntheticStages(request, payload, config, fetcher) {
+  const encoded = request.headers.get('x-origin-receipt-reservation');
+  const signature = request.headers.get('x-origin-receipt-signature');
+  const reservation = JSON.parse(encoded); const specs = {};
+  for (const stage of ['entry', 'completion']) {
+    const receipt = { schemaVersion: 1, id: reservation[stage].id, runId: config.APP_RUN_ID, requestId: payload.requestId, scenarioId: config.APP_SCENARIO, targetRole: config.APP_ROLE, producerId: config.APP_PRODUCER, sequence: reservation[stage].sequence, observedAt: reservation.observedAt, rayId: payload.rayId ?? null, releaseDigest: config.APP_RELEASE, stage };
+    const spec = { url: 'https://telemetry.example.test/ingest', method: 'POST', headers: { authorization: `Bearer ${config.RECEIPT_INGEST_SECRET}`, 'content-type': 'application/json', 'x-origin-receipt-reservation': encoded, 'x-origin-receipt-signature': signature }, body: JSON.stringify(receipt) };
+    const response = await fetcher.fetch(new Request(spec.url, { ...spec, signal: request.signal }));
+    await response.body?.cancel();
+    if (response.status !== 204 || response.headers.get('x-receipt-id') !== receipt.id) throw new Error('Synthetic stage rejected');
+    specs[stage] = spec;
+  }
+  return specs;
+}

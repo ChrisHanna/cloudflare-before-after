@@ -1,0 +1,77 @@
+import { DurableObject } from 'cloudflare:workers';
+import { OriginContainer, ContainerProxy, default as deployed } from '../../apps/storefront-worker/src/deployed.js';
+import { RegistrationVerifier, TEST_SECRET, TEST_SITEKEY } from '../../apps/storefront-worker/src/turnstile.js';
+import { telemetryAck } from '../../apps/storefront-worker/src/runtime-transport.js';
+import { deriveIngestSecret } from '../../apps/storefront-worker/src/registry.js';
+export { ContainerProxy };
+// Native state/namespace/SQL/KV/Request/streams/R2; synthetic supervisor/TCP only.
+export class RuntimeHarness extends DurableObject {
+  events = []; running = false; fault = ''; https;
+  constructor(ctx, env) {
+    super(ctx, env); const harness = this;
+    Object.defineProperty(ctx, 'container', { configurable: true, value: {
+      get running() { return harness.running; },
+      start(config) { harness.events.push({ kind: 'start', internet: config.enableInternet, ca: config.env?.NODE_EXTRA_CA_CERTS }); if (harness.fault === 'start') throw new Error('CANARY_PROVIDER_PRIVATE'); harness.running = true; },
+      monitor() { return new Promise(() => {}); }, signal() { harness.running = false; }, async destroy() { harness.running = false; },
+      async interceptAllOutboundHttp() { harness.events.push({ kind: 'http' }); },
+      async interceptOutboundHttp(host) { harness.events.push({ kind: 'http-host', host }); },
+      async interceptOutboundHttps(host, fetcher) { harness.events.push({ kind: 'https', host }); harness.https = fetcher; },
+      getTcpPort(port) { if (port !== 8080) throw new Error('CANARY_WRONG_PORT'); return { async fetch(input, init) {
+        const request = input instanceof Request ? input : new Request(input, init); const url = new URL(request.url);
+        if (request.method === 'GET' && url.pathname !== '/internal/checkpoint') return new Response('ok');
+        if (harness.fault === 'forward') throw new Error('CANARY_PROVIDER_PRIVATE');
+        if (url.pathname === '/internal/checkpoint') { const owner = await ctx.storage.get('producer'); return Response.json({ producerId: owner.producerId, targetRole: owner.role, scenarioId: owner.scenarioId, runId: owner.runId, lastAttemptedSequence: 2, healthy: true, watermark: new Date().toISOString() }); }
+        const p = await request.json();
+        // Stand in for the Node app: send both stage receipts through the real outbound relay.
+        const encoded = request.headers.get('x-origin-receipt-reservation'); const reservation = JSON.parse(encoded);
+        harness.lastReservation = { encoded, signature: request.headers.get('x-origin-receipt-signature') };
+        const identity = { producerId: reservation.producerId, role: reservation.role, scenarioId: reservation.scenarioId, runId: reservation.runId, releaseDigest: reservation.releaseDigest };
+        for (const stage of ['entry', 'completion']) {
+          const receipt = { schemaVersion: 1, id: reservation[stage].id, runId: reservation.runId, requestId: p.requestId, scenarioId: reservation.scenarioId, targetRole: reservation.role, producerId: reservation.producerId, sequence: reservation[stage].sequence, observedAt: reservation.observedAt, rayId: p.rayId ?? null, releaseDigest: reservation.releaseDigest, stage };
+          const relayed = await harness.https.fetch(new Request('https://telemetry.example.test/ingest', { method: 'POST', headers: { authorization: `Bearer ${await deriveIngestSecret(identity, env.INGEST_ROOT_SECRET)}`, 'content-type': 'application/json', 'x-origin-receipt-reservation': encoded, 'x-origin-receipt-signature': request.headers.get('x-origin-receipt-signature') }, body: JSON.stringify(receipt) }));
+          await relayed.body?.cancel();
+          if (relayed.status !== 204) throw new Error('Synthetic stage rejected');
+        }
+        if (harness.fault === 'parse') return new Response('CANARY_PROVIDER_PRIVATE');
+        return Response.json({ schemaVersion: 1, targetRole: p.targetRole, runId: p.runId, requestId: p.requestId, releaseDigest: env.RELEASE_DIGEST, html: '<html>Synthetic native-stream control</html>', operation: null });
+      } }; },
+    } });
+    this.inner = new OriginContainer(ctx, env);
+  }
+  async alarm() { return this.inner.alarm(); }
+  async receiptStage(value) { return this.inner.receiptStage(value); }
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === '/fault') { this.fault = (await request.json()).fault; return new Response(null, { status: 204 }); }
+    if (url.pathname === '/facts') return Response.json({ events: this.events, lastReservation: this.lastReservation, intercepted: this.inner.usingInterception, nativeKv: typeof this.ctx.storage.kv?.get, nativeSql: typeof this.ctx.storage.sql?.exec });
+    if (url.pathname === '/relay') {
+      const spec = await request.json();
+      if (!this.https) return new Response(null, { status: 503 });
+      try { return await this.https.fetch(new Request(spec.url, { method: spec.method, headers: spec.headers, body: spec.body })); } catch { return new Response(null, { status: 403 }); }
+    }
+    return this.inner.fetch(request);
+  }
+}
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (['/facts', '/relay', '/fault'].includes(url.pathname)) return env.ORIGINS.getByName(url.searchParams.get('key')).fetch(new Request(`https://fixture.test${url.pathname}`, request));
+    if (url.pathname === '/ack') {
+      const spec = await request.json();
+      try { await telemetryAck(spec.origin ?? env.TELEMETRY_ORIGIN, spec.path, env.REGISTRY_SECRET, { synthetic: true }, spec.cancel ? AbortSignal.abort() : spec.timeout ? AbortSignal.timeout(1) : undefined); return Response.json({ accepted: true }); }
+      catch { return Response.json({ accepted: false }); }
+    }
+    if (url.pathname === '/turnstile') {
+      const spec = await request.json();
+      const verifier = new RegistrationVerifier(env.DB, 'after', { config: { mode: 'test', sitekey: TEST_SITEKEY, hostname: 'synthetic.example.test', action: 'register' }, secret: TEST_SECRET,
+        dispatch: (input, init) => fetch(input, { ...init, headers: { 'x-fixture-status': String(spec.status), 'x-fixture-body': spec.body ?? 'valid' }, ...(spec.cancel ? { signal: AbortSignal.abort() } : {}), ...(spec.timeout ? { signal: AbortSignal.timeout(1) } : {}) }) });
+      return Response.json(await verifier.verify({ runId: spec.runId, requestId: spec.requestId, recordId: spec.recordId }, spec.token));
+    }
+    if (url.pathname === '/redirect-contract') {
+      let rejected = false; try { await fetch('https://telemetry.example.test/registry', { redirect: 'error' }); } catch { rejected = true; }
+      return Response.json({ rejected });
+    }
+    if (url.pathname === '/origin') return env.ORIGINS.getByName(url.searchParams.get('key')).fetch(new Request('http://container.internal/internal/render', request));
+    return deployed.fetch(request, env);
+  },
+};
